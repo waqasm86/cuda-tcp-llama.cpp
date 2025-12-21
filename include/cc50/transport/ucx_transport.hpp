@@ -21,8 +21,14 @@ public:
   Status send(uint64_t req_id, uint16_t type, const uint8_t* data, size_t len) override;
   Status progress(int timeout_ms) override;
 
+  // Exposed for tests and for the TCP-only build where UCX is disabled.
+  void pump_recv();
+
 private:
+  friend void pump_recv_locked(UcxTransport* self, std::vector<IncomingMessage>& out);
+
 #if CC50_ENABLE_UCX
+
   static void on_conn_request(ucp_conn_request_h req, void* arg);
   static void on_client_ep_close(void* arg);
 
@@ -35,7 +41,6 @@ private:
   Status post_recv(uint64_t tag);
 
   void drain_completions();
-  void pump_recv();
 
   std::mutex mu_;
 
