@@ -1,0 +1,19 @@
+# build outputs
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.ninja
+
+# binaries / libs
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# logs / cores
+*.log
+core
+core.*
