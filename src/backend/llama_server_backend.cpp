@@ -276,39 +276,80 @@ bool LlamaServerBackend::json_extract_string(const std::string& body, const char
   return json_read_string_at(body, p, out);
 }
 
+
 Status LlamaServerBackend::infer_stream(const InferRequest& req, StreamFn on_chunk, InferResult& out) {
+	std::cout << "[Backend] *** STARTING INFERENCE REQUEST ***\n" << std::flush;
   const uint64_t t0 = now_us();
   out = InferResult{};
+
+  std::cout << "[Backend] Starting inference request\n";
+  std::cout << "[Backend] Prompt: " << req.prompt << "\n";
+  std::cout << "[Backend] Max tokens: " << req.max_tokens << "\n";
 
   auto call = [&](const std::string& endpoint, const std::string& body, std::string& text_out)->Status {
     UrlParts u;
     std::string err;
-    if (!parse_http_url(opt_.base_url, endpoint, u, err)) return Status::Err("parse url: " + err);
+    
+    std::cout << "[Backend] Parsing URL: " << opt_.base_url << endpoint << "\n";
+    
+    if (!parse_http_url(opt_.base_url, endpoint, u, err)) {
+      std::cout << "[Backend] URL parse error: " << err << "\n";
+      return Status::Err("parse url: " + err);
+    }
+
+    std::cout << "[Backend] Sending POST to " << u.host << ":" << u.port << u.path << "\n";
+    std::cout << "[Backend] Request body: " << body << "\n";
 
     int status = 0;
     std::string resp_body;
+    
     auto st = http_post_json(u, opt_.connect_timeout_ms, opt_.request_timeout_ms, body, status, resp_body);
-    if (!st.ok) return st;
+    
+    if (!st.ok) {
+      std::cout << "[Backend] HTTP error: " << st.msg << "\n";
+      return st;
+    }
+    
+    std::cout << "[Backend] HTTP status: " << status << "\n";
+    std::cout << "[Backend] Response body length: " << resp_body.size() << " bytes\n";
+    std::cout << "[Backend] Response body (first 500 chars): " << resp_body.substr(0, 500) << "\n";
+    
     if (status < 200 || status >= 300) {
       return Status::Err("llama-server http status=" + std::to_string(status) + " body=" + resp_body.substr(0, 200));
     }
 
-    // Try common fields.
+    // Try common fields
     std::string tmp;
-    if (json_extract_string(resp_body, "content", tmp) ||
-        json_extract_string(resp_body, "response", tmp) ||
-        json_extract_string(resp_body, "completion", tmp) ||
-        json_extract_string(resp_body, "text", tmp)) {
+    std::cout << "[Backend] Trying to extract 'content' field...\n";
+    if (json_extract_string(resp_body, "content", tmp)) {
+      std::cout << "[Backend] Extracted content: " << tmp << "\n";
       text_out = std::move(tmp);
       return Status::Ok();
     }
 
-    // OpenAI-style: choices[0].text (we just search for the first "text":"...")
+    std::cout << "[Backend] 'content' not found, trying 'response'...\n";
+    if (json_extract_string(resp_body, "response", tmp)) {
+      std::cout << "[Backend] Extracted response: " << tmp << "\n";
+      text_out = std::move(tmp);
+      return Status::Ok();
+    }
+
+    std::cout << "[Backend] 'response' not found, trying 'completion'...\n";
+    if (json_extract_string(resp_body, "completion", tmp)) {
+      std::cout << "[Backend] Extracted completion: " << tmp << "\n";
+      text_out = std::move(tmp);
+      return Status::Ok();
+    }
+
+    std::cout << "[Backend] 'completion' not found, trying 'text'...\n";
     if (json_extract_string(resp_body, "text", tmp)) {
+      std::cout << "[Backend] Extracted text: " << tmp << "\n";
       text_out = std::move(tmp);
       return Status::Ok();
     }
 
+    std::cout << "[Backend] ERROR: Could not parse completion text from response\n";
+    std::cout << "[Backend] Full response: " << resp_body << "\n";
     return Status::Err("could not parse completion text from response (unexpected schema)");
   };
 
@@ -321,8 +362,11 @@ Status LlamaServerBackend::infer_stream(const InferRequest& req, StreamFn on_chu
     body += "\"stream\":false";
     body += "}";
 
+    std::cout << "[Backend] Attempting primary endpoint: " << opt_.endpoint << "\n";
     auto st = call(opt_.endpoint, body, text);
+    
     if (!st.ok) {
+      std::cout << "[Backend] Primary endpoint failed, trying fallback...\n";
       // Fallback: /v1/completions
       std::string body2 = "{";
       body2 += "\"model\":\"\",";
@@ -330,24 +374,35 @@ Status LlamaServerBackend::infer_stream(const InferRequest& req, StreamFn on_chu
       body2 += "\"max_tokens\":" + std::to_string(req.max_tokens) + ",";
       body2 += "\"stream\":false";
       body2 += "}";
+      
       auto st2 = call("/v1/completions", body2, text);
       if (!st2.ok) {
         out.error = st.msg + " | fallback: " + st2.msg;
+        std::cout << "[Backend] Both endpoints failed: " << out.error << "\n";
         return Status::Err(out.error);
       }
     }
   }
 
-  // Re-chunk into RESP_CHUNK messages to mimic streaming.
+  std::cout << "[Backend] Successfully got text, length: " << text.size() << " bytes\n";
+
+  // Re-chunk into RESP_CHUNK messages to mimic streaming
   out.text = text;
-  out.tokens = 0; // token count unknown without server-provided metadata
+  out.tokens = 0; // token count unknown
+  
+  std::cout << "[Backend] Sending chunks to client...\n";
   for (size_t i = 0; i < text.size(); i += opt_.chunk_bytes) {
     std::string_view sv(text.data() + i, std::min(opt_.chunk_bytes, text.size() - i));
-    if (on_chunk) on_chunk(std::string(sv));
+    if (on_chunk) {
+      std::cout << "[Backend] Sending chunk: " << std::string(sv) << "\n";
+      on_chunk(std::string(sv));
+    }
   }
 
   out.elapsed_us = now_us() - t0;
+  std::cout << "[Backend] Inference complete, elapsed: " << out.elapsed_us << " us\n";
   return Status::Ok();
 }
+
 
 } // namespace cc50

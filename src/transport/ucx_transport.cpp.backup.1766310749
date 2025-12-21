@@ -43,22 +43,27 @@ UcxTransport::UcxTransport() {
 UcxTransport::~UcxTransport() {
   std::cout << "[UCX] Transport destructor called\n";
   
+  // CRITICAL: Cleanup in correct order
   if (ep_) {
+    std::cout << "[UCX] Destroying endpoint\n";
     ucp_ep_destroy(ep_);
     ep_ = nullptr;
   }
   
   if (listener_) {
+    std::cout << "[UCX] Destroying listener\n";
     ucp_listener_destroy(listener_);
     listener_ = nullptr;
   }
   
   if (worker_) {
+    std::cout << "[UCX] Destroying worker\n";
     ucp_worker_destroy(worker_);
     worker_ = nullptr;
   }
   
   if (ucp_ctx_) {
+    std::cout << "[UCX] Cleaning up context\n";
     ucp_cleanup(ucp_ctx_);
     ucp_ctx_ = nullptr;
   }
@@ -71,27 +76,28 @@ UcxTransport::~UcxTransport() {
 
 Status UcxTransport::init_ucx_common() {
   std::cout << "[UCX] Initializing UCX common...\n";
-  std::cout << "[UCX] sizeof(ucp_params_t) = " << sizeof(ucp_params_t) << "\n";
   
+  // CRITICAL FIX: Properly initialize params struct
   ucp_params_t params;
   std::memset(&params, 0, sizeof(params));
   
+  // Set required fields
   params.field_mask = UCP_PARAM_FIELD_FEATURES | 
                       UCP_PARAM_FIELD_REQUEST_SIZE |
                       UCP_PARAM_FIELD_REQUEST_INIT;
   params.features = UCP_FEATURE_TAG;
+  
+  // CRITICAL: Set request size to avoid heap corruption
   params.request_size = sizeof(void*);
   params.request_init = nullptr;
 
-  std::cout << "[UCX] About to call ucp_config_read...\n";
-  
   ucp_config_t* config = nullptr;
   ucs_status_t st = ucp_config_read(nullptr, nullptr, &config);
   if (st != UCS_OK) {
     return ucx_err("ucp_config_read", st);
   }
 
-  std::cout << "[UCX] Config read successfully, calling ucp_init...\n";
+  std::cout << "[UCX] Config read successfully\n";
 
   st = ucp_init(&params, config, &ucp_ctx_);
   ucp_config_release(config);
@@ -105,8 +111,9 @@ Status UcxTransport::init_ucx_common() {
 }
 
 Status UcxTransport::create_worker_with_wakeup() {
-  std::cout << "[UCX] Creating worker...\n";
+  std::cout << "[UCX] Creating worker with wakeup...\n";
   
+  // CRITICAL FIX: Properly initialize worker params
   ucp_worker_params_t wparams;
   std::memset(&wparams, 0, sizeof(wparams));
   
@@ -120,6 +127,7 @@ Status UcxTransport::create_worker_with_wakeup() {
 
   std::cout << "[UCX] Worker created successfully\n";
 
+  // Create epoll for progress
   epoll_fd_ = epoll_create1(0);
   if (epoll_fd_ < 0) {
     return Status::Err(std::string("epoll_create1 failed: ") + std::strerror(errno));
@@ -127,6 +135,7 @@ Status UcxTransport::create_worker_with_wakeup() {
 
   std::cout << "[UCX] Epoll fd created: " << epoll_fd_ << "\n";
 
+  // Try to get UCX event fd (optional for some transports)
   int efd = -1;
   st = ucp_worker_get_efd(worker_, &efd);
   if (st == UCS_OK && efd >= 0) {
@@ -137,12 +146,12 @@ Status UcxTransport::create_worker_with_wakeup() {
     ev.data.fd = ucx_efd_;
     
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, ucx_efd_, &ev) < 0) {
-      std::cout << "[UCX] Warning: Could not add UCX efd to epoll\n";
+      std::cout << "[UCX] Warning: Could not add UCX efd to epoll (not critical for tcp transport)\n";
     } else {
-      std::cout << "[UCX] UCX event fd registered\n";
+      std::cout << "[UCX] UCX event fd registered with epoll\n";
     }
   } else {
-    std::cout << "[UCX] No UCX event fd (using tcp/self)\n";
+    std::cout << "[UCX] No UCX event fd available (using tcp or self transport)\n";
   }
 
   return Status::Ok();
@@ -153,16 +162,17 @@ void UcxTransport::on_conn_request(ucp_conn_request_h req, void* arg) {
   
   auto* self = reinterpret_cast<UcxTransport*>(arg);
   if (!self) {
-    std::cerr << "[UCX] ERROR: Invalid self pointer\n";
+    std::cerr << "[UCX] ERROR: Invalid self pointer in callback\n";
     return;
   }
   
   if (self->ep_) {
-    std::cout << "[UCX] Already have endpoint, rejecting\n";
+    std::cout << "[UCX] Already have an endpoint, rejecting\n";
     ucp_listener_reject(self->listener_, req);
     return;
   }
 
+  // CRITICAL FIX: Properly initialize endpoint params
   ucp_ep_params_t epp;
   std::memset(&epp, 0, sizeof(epp));
   
@@ -176,21 +186,23 @@ void UcxTransport::on_conn_request(ucp_conn_request_h req, void* arg) {
     return;
   }
 
-  std::cout << "[UCX] Endpoint created\n";
+  std::cout << "[UCX] Endpoint created successfully\n";
 }
 
 Status UcxTransport::create_listener() {
   std::cout << "[UCX] Creating listener on " << opt_.listen_host << ":" << opt_.listen_port << "\n";
   
+  // CRITICAL FIX: Properly initialize sockaddr
   sockaddr_in addr;
   std::memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons(opt_.listen_port);
   
   if (::inet_pton(AF_INET, opt_.listen_host.c_str(), &addr.sin_addr) != 1) {
-    return Status::Err("inet_pton failed for: " + opt_.listen_host);
+    return Status::Err("inet_pton failed for listen host: " + opt_.listen_host);
   }
 
+  // CRITICAL FIX: Properly initialize listener params
   ucp_listener_params_t lp;
   std::memset(&lp, 0, sizeof(lp));
   
@@ -206,22 +218,24 @@ Status UcxTransport::create_listener() {
     return ucx_err("ucp_listener_create", st);
   }
 
-  std::cout << "[UCX] Listener created\n";
+  std::cout << "[UCX] Listener created successfully\n";
   return Status::Ok();
 }
 
 Status UcxTransport::connect_to_server() {
   std::cout << "[UCX] Connecting to " << opt_.server_host << ":" << opt_.server_port << "\n";
   
+  // CRITICAL FIX: Properly initialize sockaddr
   sockaddr_in addr;
   std::memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons(opt_.server_port);
   
   if (::inet_pton(AF_INET, opt_.server_host.c_str(), &addr.sin_addr) != 1) {
-    return Status::Err("inet_pton failed for: " + opt_.server_host);
+    return Status::Err("inet_pton failed for server host: " + opt_.server_host);
   }
 
+  // CRITICAL FIX: Properly initialize endpoint params
   ucp_ep_params_t epp;
   std::memset(&epp, 0, sizeof(epp));
   
@@ -235,7 +249,7 @@ Status UcxTransport::connect_to_server() {
     return ucx_err("ucp_ep_create(client)", st);
   }
 
-  std::cout << "[UCX] Connected\n";
+  std::cout << "[UCX] Connected to server successfully\n";
   return Status::Ok();
 }
 
@@ -255,8 +269,11 @@ Status UcxTransport::start_server(const TransportOptions& opt, MessageHandler on
   s = create_listener();
   if (!s.ok) return s;
 
+  // Pre-allocate receive buffer
   rx_buf_.resize(1024 * 1024);
-  std::cout << "[UCX] Server started\n";
+  std::cout << "[UCX] Receive buffer allocated: " << rx_buf_.size() << " bytes\n";
+
+  std::cout << "[UCX] Server started successfully\n";
   return Status::Ok();
 }
 
@@ -276,28 +293,35 @@ Status UcxTransport::start_client(const TransportOptions& opt, MessageHandler on
   s = connect_to_server();
   if (!s.ok) return s;
 
+  // Pre-allocate receive buffer
   rx_buf_.resize(1024 * 1024);
-  std::cout << "[UCX] Client started\n";
+  std::cout << "[UCX] Receive buffer allocated: " << rx_buf_.size() << " bytes\n";
+
+  std::cout << "[UCX] Client started successfully\n";
   return Status::Ok();
 }
 
+// Simple tag scheme:
+// - requests use tag 0xCC50_0001
+// - responses use tag 0xCC50_0002
 static constexpr uint64_t TAG_REQ  = 0xCC500001ull;
 static constexpr uint64_t TAG_RESP = 0xCC500002ull;
 
 Status UcxTransport::send_bytes(const uint8_t* bytes, size_t len, uint64_t tag) {
   if (!ep_) {
-    return Status::Err("UCX endpoint not connected");
+    return Status::Err("UCX endpoint not connected yet");
   }
   
   ucp_request_param_t param;
   std::memset(&param, 0, sizeof(param));
-  param.op_attr_mask = 0;
+  param.op_attr_mask = 0; // synchronous
   
   void* req = ucp_tag_send_nbx(ep_, bytes, len, tag, &param);
   return ucx_wait(worker_, req);
 }
 
 Status UcxTransport::send(uint64_t req_id, uint16_t type, const uint8_t* data, size_t len) {
+  // Pack as: MsgHeader + payload
   MsgHeader h;
   std::memset(&h, 0, sizeof(h));
   h.magic = kMagic;
@@ -321,6 +345,7 @@ Status UcxTransport::send(uint64_t req_id, uint16_t type, const uint8_t* data, s
 void UcxTransport::pump_recv() {
   if (!worker_) return;
 
+  // Probe for either request or response depending on mode
   uint64_t tag = is_server_ ? TAG_REQ : TAG_RESP;
   uint64_t tag_mask = 0xFFFFFFFFFFFFFFFFull;
 
@@ -377,12 +402,18 @@ Status UcxTransport::progress(int timeout_ms) {
     return Status::Err("UCX worker not initialized");
   }
 
+  // Try to arm wakeup (may fail for tcp transport, that's OK)
   ucp_worker_arm(worker_);
 
-  while (ucp_worker_progress(worker_) != 0) {}
+  // Progress UCX
+  while (ucp_worker_progress(worker_) != 0) {
+    // Keep progressing while there's work
+  }
 
+  // Check for incoming messages
   pump_recv();
 
+  // Small sleep to avoid busy-waiting
   if (timeout_ms > 0) {
     epoll_event ev;
     std::memset(&ev, 0, sizeof(ev));
@@ -398,20 +429,21 @@ Status UcxTransport::progress(int timeout_ms) {
 } // namespace cc50
 
 #else
+// CC50_ENABLE_UCX not defined
 namespace cc50 {
 UcxTransport::UcxTransport() {}
 UcxTransport::~UcxTransport() {}
 Status UcxTransport::start_server(const TransportOptions&, MessageHandler) { 
-  return Status::Err("UCX not enabled"); 
+  return Status::Err("UCX not enabled at compile time"); 
 }
 Status UcxTransport::start_client(const TransportOptions&, MessageHandler) { 
-  return Status::Err("UCX not enabled"); 
+  return Status::Err("UCX not enabled at compile time"); 
 }
 Status UcxTransport::send(uint64_t, uint16_t, const uint8_t*, size_t) { 
-  return Status::Err("UCX not enabled"); 
+  return Status::Err("UCX not enabled at compile time"); 
 }
 Status UcxTransport::progress(int) { 
-  return Status::Err("UCX not enabled"); 
+  return Status::Err("UCX not enabled at compile time"); 
 }
 } // namespace cc50
 #endif

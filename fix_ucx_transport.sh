@@ -1,3 +1,19 @@
+#!/bin/bash
+# Direct fix for ucx_transport.cpp
+
+set -e
+
+cd /media/waqasm86/External1/Project-CPP/Project-Nvidia/ucx-llama-infer-accel-10
+
+echo "=== UCX Transport Direct Fix ==="
+echo
+
+# Backup original
+cp src/transport/ucx_transport.cpp src/transport/ucx_transport.cpp.backup.$(date +%s)
+echo "✓ Backup created"
+
+# Create the fixed file
+cat > src/transport/ucx_transport.cpp << 'EOFUCX'
 #include "cc50/transport/ucx_transport.hpp"
 #include "cc50/protocol.hpp"
 
@@ -415,3 +431,31 @@ Status UcxTransport::progress(int) {
 }
 } // namespace cc50
 #endif
+EOFUCX
+
+echo "✓ Fixed ucx_transport.cpp created"
+
+# Verify the fix
+echo
+echo "Verifying critical fixes are present:"
+if grep -q "request_size = sizeof(void\*)" src/transport/ucx_transport.cpp; then
+    echo "  ✓ request_size fix present"
+else
+    echo "  ✗ request_size fix MISSING"
+    exit 1
+fi
+
+if grep -q "ucp_tag_send_nbx" src/transport/ucx_transport.cpp; then
+    echo "  ✓ nbx API fix present"
+else
+    echo "  ✗ nbx API fix MISSING"
+    exit 1
+fi
+
+echo
+echo "=== Fix applied successfully! ==="
+echo "Now rebuild with: ./rebuild_script.sh"
+EOFUCX
+
+chmod +x fix_ucx_transport.sh
+echo "✓ Fix script created"
