@@ -115,3 +115,4 @@ If your llama-server version returns a different schema, update:
 This repo is intentionally C++/systems-focused. GGUF + llama.cpp keeps the serving story native and lightweight, matching UCX/CUDA workflows more directly than a PyTorch/HuggingFace stack.
 # ucx-cuda
 # ucx-cuda-12
+# ucx-cuda-12
