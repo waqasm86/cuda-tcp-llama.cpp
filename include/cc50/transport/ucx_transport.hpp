@@ -25,8 +25,9 @@ public:
   void pump_recv();
 
 private:
-#if CC50_ENABLE_UCX
   friend void pump_recv_locked(UcxTransport* self, std::vector<IncomingMessage>& out);
+
+#if CC50_ENABLE_UCX
 
   static void on_conn_request(ucp_conn_request_h req, void* arg);
   static void on_client_ep_close(void* arg);
