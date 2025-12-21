@@ -1,12 +1,13 @@
 #pragma once
 #include "transport.hpp"
 
-#ifdef CC50_ENABLE_UCX
+#if CC50_ENABLE_UCX
 #include <ucp/api/ucp.h>
 #endif
 
 #include <vector>
 #include <unordered_map>
+#include <mutex>
 
 namespace cc50 {
 
@@ -21,7 +22,7 @@ public:
   Status progress(int timeout_ms) override;
 
 private:
-#ifdef CC50_ENABLE_UCX
+#if CC50_ENABLE_UCX
   static void on_conn_request(ucp_conn_request_h req, void* arg);
   static void on_client_ep_close(void* arg);
 
@@ -35,6 +36,8 @@ private:
 
   void drain_completions();
   void pump_recv();
+
+  std::mutex mu_;
 
   ucp_context_h ucp_ctx_{nullptr};
   ucp_worker_h  worker_{nullptr};

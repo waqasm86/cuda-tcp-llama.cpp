@@ -3,7 +3,14 @@
 
 set -e
 
-PROJECT_DIR="/media/waqasm86/External1/Project-CPP/Project-Nvidia/ucx-llama-infer-accel-10"
+# FIX: Use the current working directory instead of a hardcoded path
+PROJECT_DIR=$(pwd)
+cd "$PROJECT_DIR"
+
+echo "=== UCX-LLAMA Bridge Rebuild ==="
+echo "Building in: $PROJECT_DIR"
+
+# PROJECT_DIR="/media/waqasm86/External1/Project-CPP/Project-Nvidia/ucx-llama-infer-accel-11"
 
 cd "$PROJECT_DIR"
 
@@ -45,9 +52,30 @@ cmake -S . -B build -G Ninja \
 
 echo
 
+# Deep Clean
+# echo -e "${YELLOW}[2] Cleaning old build...${NC}"
+rm -rf build
+mkdir -p build
+
+# Configure with AddressSanitizer FORCED
+# NOTE: We add -fno-omit-frame-pointer for better stack traces
+echo -e "${YELLOW}[3] Configuring CMake...${NC}"
+export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCC50_ENABLE_UCX=ON \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+
 # Build
-echo -e "${YELLOW}[4] Building...${NC}"
-ninja -C build -v
+#echo -e "${YELLOW}[4] Building...${NC}"
+#cmake --build build --clean-first
+cmake --build build
+
+
+# Build
+#echo -e "${YELLOW}[4] Building...${NC}"
+#ninja -C build -v
 
 echo
 

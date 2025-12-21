@@ -17,3 +17,6 @@ compile_commands.json
 *.log
 core
 core.*
+
+# build outputs
+build/
