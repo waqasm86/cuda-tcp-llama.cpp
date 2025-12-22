@@ -6,7 +6,7 @@
 namespace cc50 {
 
 // Backend that calls an external llama.cpp `llama-server` over HTTP.
-// This avoids ABI churn and keeps your UCX runtime independent from libllama.
+// This avoids ABI churn and keeps the transport/runtime layer independent from libllama.
 //
 // Expected server endpoints:
 //   - POST /completion  (llama.cpp classic)  body: {"prompt": "...", "n_predict": 128, "stream": false}

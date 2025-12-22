@@ -1,7 +1,6 @@
 #include "cc50/common.hpp"
 #include "cc50/protocol.hpp"
 #include "cc50/transport/tcp_transport.hpp"
-#include "cc50/transport/ucx_transport.hpp"
 #include "cc50/backend/toy_backend.hpp"
 #include "cc50/backend/llama_server_backend.hpp"
 #include "cc50/backend/backend.hpp"
@@ -20,7 +19,7 @@
 namespace cc50 {
 
 struct ServerConfig {
-  std::string transport{"tcp"};       // tcp|ucx
+  std::string transport{"tcp"};       // tcp only (legacy flag kept for compatibility)
   std::string backend{"toy"};         // toy|llama_server
   std::string listen{"0.0.0.0:9199"};
 
@@ -70,12 +69,8 @@ public:
     st = backend_->load_model(cfg_.model, cfg_.ctx, cfg_.threads);
     if (!st.ok) return st;
 
-    // Select transport
-    if (cfg_.transport == "ucx") {
-      transport_ = std::make_unique<UcxTransport>();
-    } else {
-      transport_ = std::make_unique<TcpTransport>();
-    }
+    // Transport is TCP-only now (legacy flag retained for compatibility)
+    transport_ = std::make_unique<TcpTransport>();
 
     TransportOptions opt;
     if (!parse_hostport(cfg_.listen, opt.listen_host, opt.listen_port)) {
@@ -195,7 +190,6 @@ private:
 
 static void usage() {
   std::cerr << R"(cc50_llm_server
-  --transport=tcp|ucx
   --backend=toy|llama_server
   --listen=HOST:PORT
   --max-tokens-default=128
@@ -208,8 +202,8 @@ Example:
   # Terminal 1: start llama-server (from your llama.cpp build)
   #   ./build-llama/bin/llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080
   #
-  # Terminal 2: start UCX server that bridges UCX -> llama-server HTTP:
-  #   ./build/bin/cc50_llm_server --transport=ucx --backend=llama_server --listen=127.0.0.1:9199 \
+  # Terminal 2: start TCP server that bridges TCP -> llama-server HTTP:
+  #   ./build/bin/cc50_llm_server --backend=llama_server --listen=127.0.0.1:9199 \
   #     --llama-url=http://127.0.0.1:8080 --llama-endpoint=/completion
 )";
 }
@@ -218,7 +212,6 @@ int main(int argc, char** argv) {
   cc50::ServerConfig cfg;
 
   static option opts[] = {
-    {"transport", required_argument, nullptr, 't'},
     {"backend", required_argument, nullptr, 'b'},
     {"listen", required_argument, nullptr, 'l'},
     {"max-tokens-default", required_argument, nullptr, 'k'},
@@ -233,10 +226,9 @@ int main(int argc, char** argv) {
 
   while (true) {
     int idx = 0;
-    int c = getopt_long(argc, argv, "t:b:l:k:u:e:m:c:p:h", opts, &idx);
+    int c = getopt_long(argc, argv, "b:l:k:u:e:m:c:p:h", opts, &idx);
     if (c == -1) break;
     switch (c) {
-      case 't': cfg.transport = optarg; break;
       case 'b': cfg.backend = optarg; break;
       case 'l': cfg.listen = optarg; break;
       case 'k': cfg.max_tokens_default = (uint32_t)std::stoul(optarg); break;
