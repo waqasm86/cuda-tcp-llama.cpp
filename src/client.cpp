@@ -1,9 +1,9 @@
 #include "cc50/common.hpp"
 #include "cc50/protocol.hpp"
 #include "cc50/transport/tcp_transport.hpp"
-#include "cc50/transport/ucx_transport.hpp"
 
 #include <getopt.h>
+#include <algorithm>
 #include <iostream>
 #include <vector>
 #include <atomic>
@@ -13,9 +13,8 @@
 namespace cc50 {
 
 struct ClientConfig {
-  std::string transport{"tcp"};
   std::string server{"127.0.0.1:9199"};
-  std::string prompt{"Hello from UCX client. Write one sentence."};
+  std::string prompt{"Hello from TCP client. Write one sentence."};
   uint32_t max_tokens{64};
   uint32_t iters{10};
   bool print_chunks{false};
@@ -43,7 +42,6 @@ static double percentile(std::vector<double> v, double p) {
 
 static void usage() {
   std::cerr << R"(cc50_llm_client
-  --transport=tcp|ucx
   --server=HOST:PORT
   --prompt="..."
   --max-tokens=64
@@ -51,8 +49,8 @@ static void usage() {
   --print=0|1
 
 Example:
-  ./build/bin/cc50_llm_client --transport=ucx --server=127.0.0.1:9199 \
-    --prompt "Explain UCX in one paragraph" --max-tokens 128 --iters 5 --print 1
+  ./build/bin/cc50_llm_client --server=127.0.0.1:9199 \
+    --prompt "Hello from TCP" --max-tokens 128 --iters 5 --print 1
 )";
 }
 
@@ -60,7 +58,6 @@ int main(int argc, char** argv) {
   cc50::ClientConfig cfg;
 
   static option opts[] = {
-    {"transport", required_argument, nullptr, 't'},
     {"server", required_argument, nullptr, 's'},
     {"prompt", required_argument, nullptr, 'p'},
     {"max-tokens", required_argument, nullptr, 'k'},
@@ -72,10 +69,9 @@ int main(int argc, char** argv) {
 
   while (true) {
     int idx = 0;
-    int c = getopt_long(argc, argv, "t:s:p:k:i:P:h", opts, &idx);
+    int c = getopt_long(argc, argv, "s:p:k:i:P:h", opts, &idx);
     if (c == -1) break;
     switch (c) {
-      case 't': cfg.transport = optarg; break;
       case 's': cfg.server = optarg; break;
       case 'p': cfg.prompt = optarg; break;
       case 'k': cfg.max_tokens = (uint32_t)std::stoul(optarg); break;
@@ -86,9 +82,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::unique_ptr<cc50::ITransport> tr;
-  if (cfg.transport == "ucx") tr = std::make_unique<cc50::UcxTransport>();
-  else tr = std::make_unique<cc50::TcpTransport>();
+  std::unique_ptr<cc50::ITransport> tr = std::make_unique<cc50::TcpTransport>();
 
   cc50::TransportOptions opt;
   {

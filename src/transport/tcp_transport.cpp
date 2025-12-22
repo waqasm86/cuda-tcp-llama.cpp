@@ -1,422 +1,241 @@
-#include "cc50/transport/ucx_transport.hpp"
+#include "cc50/transport/tcp_transport.hpp"
 #include "cc50/protocol.hpp"
 
-#if CC50_ENABLE_UCX
-
 #include <arpa/inet.h>
-#include <errno.h>
+#include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cstring>
 #include <iostream>
-#include <vector>
+#include <stdexcept>
 
 namespace cc50 {
 
-// ---------------------------- helpers ----------------------------
+namespace {
+constexpr int kListenBacklog = 16;
+constexpr size_t kReadChunk  = 4096;
 
-static Status ucx_err(const char* where, ucs_status_t st) {
-  return Status::Err(std::string(where) + ": " + ucs_status_string(st));
+int make_non_blocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static Status ucx_wait(ucp_worker_h worker, void* req) {
-  if (req == nullptr) return Status::Ok();
-  if (UCS_PTR_IS_ERR(req)) {
-    ucs_status_t st = UCS_PTR_STATUS(req);
-    return Status::Err(std::string("UCX request error: ") + ucs_status_string(st));
-  }
-
-  ucs_status_t st = UCS_INPROGRESS;
-  while ((st = ucp_request_check_status(req)) == UCS_INPROGRESS) {
-    ucp_worker_progress(worker);
-  }
-
-  ucp_request_free(req);
-
-  if (st != UCS_OK) {
-    return Status::Err(std::string("UCX request failed: ") + ucs_status_string(st));
+Status add_epoll_fd(int ep, int fd, uint32_t events) {
+  epoll_event ev{};
+  ev.events  = events;
+  ev.data.fd = fd;
+  if (epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) < 0) {
+    return Status::Err(std::string("epoll_ctl add failed: ") + std::strerror(errno));
   }
   return Status::Ok();
 }
 
-static constexpr uint64_t TAG_REQ  = 0xCC500001ull;
-static constexpr uint64_t TAG_RESP = 0xCC500002ull;
-
-// Collect received messages while holding mu_.
-// IMPORTANT: this does NOT call on_msg_ while the mutex is held.
-static void pump_recv_locked(UcxTransport* self, std::vector<IncomingMessage>& out) {
-  if (!self || !self->worker_) return;
-
-  const uint64_t tag      = self->is_server_ ? TAG_REQ : TAG_RESP;
-  const uint64_t tag_mask = 0xFFFFFFFFFFFFFFFFull;
-
-  for (;;) {
-    ucp_tag_recv_info_t info;
-    std::memset(&info, 0, sizeof(info));
-
-    ucp_tag_message_h msg = ucp_tag_probe_nb(self->worker_, tag, tag_mask, 1, &info);
-    if (!msg) break;
-
-    const size_t len = info.length;
-    if (len < sizeof(MsgHeader)) {
-      // Consume it anyway
-      std::vector<uint8_t> tmp(len);
-      ucp_request_param_t p;
-      std::memset(&p, 0, sizeof(p));
-      void* req = ucp_tag_msg_recv_nbx(self->worker_, tmp.data(), len, msg, &p);
-      (void)ucx_wait(self->worker_, req);
-      continue;
-    }
-
-    if (len > self->rx_buf_.size()) {
-      self->rx_buf_.resize(len);
-    }
-
-    ucp_request_param_t param;
-    std::memset(&param, 0, sizeof(param));
-    param.op_attr_mask = 0;
-
-    void* req = ucp_tag_msg_recv_nbx(self->worker_, self->rx_buf_.data(), len, msg, &param);
-    if (UCS_PTR_IS_ERR(req)) {
-      std::cerr << "[UCX] Receive error: " << ucs_status_string(UCS_PTR_STATUS(req)) << "\n";
-      break;
-    }
-
-    Status st = ucx_wait(self->worker_, req);
-    if (!st.ok) {
-      std::cerr << "[UCX] Wait failed: " << st.msg << "\n";
-      break;
-    }
-
-    MsgHeader h;
-    std::memcpy(&h, self->rx_buf_.data(), sizeof(MsgHeader));
-    if (h.magic != kMagic) continue;
-
-    IncomingMessage im;
-    im.req_id = h.req_id;
-    im.type   = h.type;
-
-    const size_t plen = len - sizeof(MsgHeader);
-    im.payload.resize(plen);
-    if (plen) {
-      std::memcpy(im.payload.data(),
-                  self->rx_buf_.data() + sizeof(MsgHeader),
-                  plen);
-    }
-
-    out.emplace_back(std::move(im));
+Status mod_epoll_fd(int ep, int fd, uint32_t events) {
+  epoll_event ev{};
+  ev.events  = events;
+  ev.data.fd = fd;
+  if (epoll_ctl(ep, EPOLL_CTL_MOD, fd, &ev) < 0) {
+    return Status::Err(std::string("epoll_ctl mod failed: ") + std::strerror(errno));
   }
-}
-
-// ---------------------------- lifecycle ----------------------------
-
-UcxTransport::UcxTransport() {
-  std::cout << "[UCX] Transport constructor called\n";
-
-  // CRITICAL: initialize all members to known-safe values.
-  // This prevents ucp_cleanup()/close()/destroy on garbage pointers/fds.
-  ucp_ctx_  = nullptr;
-  worker_   = nullptr;
-  ep_       = nullptr;
-  listener_ = nullptr;
-
-  epoll_fd_ = -1;
-  ucx_efd_  = -1;
-
-  is_server_ = false;
-
-  // Default rx buffer (will grow as needed)
-  rx_buf_.resize(1024 * 1024);
-}
-
-UcxTransport::~UcxTransport() {
-  std::lock_guard<std::mutex> lk(mu_);
-
-  if (ep_) {
-    ucp_ep_destroy(ep_);
-    ep_ = nullptr;
-  }
-  if (listener_) {
-    ucp_listener_destroy(listener_);
-    listener_ = nullptr;
-  }
-  if (worker_) {
-    ucp_worker_destroy(worker_);
-    worker_ = nullptr;
-  }
-  if (epoll_fd_ >= 0) {
-    close(epoll_fd_);
-    epoll_fd_ = -1;
-  }
-  ucx_efd_ = -1;
-
-  if (ucp_ctx_) {
-    ucp_cleanup(ucp_ctx_);
-    ucp_ctx_ = nullptr;
-  }
-}
-
-Status UcxTransport::init_ucx_common() {
-  std::cout << "[UCX] Initializing UCX common...\n";
-
-  // NOTE: do NOT destroy worker/ep/listener here; do it in create_worker_with_wakeup()
-  // because start_server/start_client call init_ucx_common() and then create_worker_with_wakeup().
-  if (ucp_ctx_) {
-    ucp_cleanup(ucp_ctx_);
-    ucp_ctx_ = nullptr;
-  }
-
-  ucp_config_t* config = nullptr;
-  ucs_status_t st = ucp_config_read(nullptr, nullptr, &config);
-  if (st != UCS_OK || !config) {
-    return ucx_err("ucp_config_read", st);
-  }
-
-  ucp_params_t params;
-  std::memset(&params, 0, sizeof(params));
-
-  // Keep field_mask minimal and fully initialized fields only.
-  // TAG is required; WAKEUP enables worker_get_efd + worker_arm.
-  params.field_mask        = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_MT_WORKERS_SHARED;
-  params.features          = UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP;
-  params.mt_workers_shared = 1;
-
-  std::cout << "[UCX] Calling ucp_init...\n";
-  st = ucp_init(&params, config, &ucp_ctx_);
-
-  ucp_config_release(config);
-  config = nullptr;
-
-  if (st != UCS_OK || !ucp_ctx_) {
-    ucp_ctx_ = nullptr;
-    return ucx_err("ucp_init", st);
-  }
-
-  std::cout << "[UCX] UCX context initialized\n";
   return Status::Ok();
 }
 
-Status UcxTransport::create_worker_with_wakeup() {
-  std::cout << "[UCX] Creating worker...\n";
+}  // namespace
 
-  if (!ucp_ctx_) return Status::Err("UCX context not initialized");
-
-  // Defensive cleanup (safe even if called more than once)
-  if (ep_) { ucp_ep_destroy(ep_); ep_ = nullptr; }
-  if (listener_) { ucp_listener_destroy(listener_); listener_ = nullptr; }
-  if (worker_) { ucp_worker_destroy(worker_); worker_ = nullptr; }
-  if (epoll_fd_ >= 0) { close(epoll_fd_); epoll_fd_ = -1; }
-  ucx_efd_ = -1;
-
-  ucp_worker_params_t wparams;
-  std::memset(&wparams, 0, sizeof(wparams));
-  wparams.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
-  wparams.thread_mode = UCS_THREAD_MODE_MULTI;  // you use send/progress across threads
-
-  ucs_status_t st = ucp_worker_create(ucp_ctx_, &wparams, &worker_);
-  if (st != UCS_OK || !worker_) {
-    worker_ = nullptr;
-    return ucx_err("ucp_worker_create", st);
-  }
-
-  std::cout << "[UCX] Worker created successfully\n";
-
-  epoll_fd_ = epoll_create1(0);
-  if (epoll_fd_ < 0) {
-    return Status::Err(std::string("epoll_create1 failed: ") + std::strerror(errno));
-  }
-
-  std::cout << "[UCX] Epoll fd created: " << epoll_fd_ << "\n";
-
-  // WAKEUP integration (optional; may be unsupported on some transports)
-  int efd = -1;
-  st = ucp_worker_get_efd(worker_, &efd);
-  if (st == UCS_OK && efd >= 0) {
-    ucx_efd_ = efd;
-
-    epoll_event ev;
-    std::memset(&ev, 0, sizeof(ev));
-    ev.events  = EPOLLIN;
-    ev.data.fd = ucx_efd_;
-
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, ucx_efd_, &ev) < 0) {
-      std::cout << "[UCX] Warning: Could not add UCX efd to epoll: " << std::strerror(errno) << "\n";
-      ucx_efd_ = -1;
-    } else {
-      std::cout << "[UCX] UCX event fd registered\n";
-    }
-  } else {
-    std::cout << "[UCX] No UCX event fd (using tcp/self)\n";
-  }
-
-  return Status::Ok();
+TcpTransport::TcpTransport() {
+  ep_ = epoll_create1(0);
 }
 
-// ---------------------------- connection handling ----------------------------
-
-void UcxTransport::on_conn_request(ucp_conn_request_h req, void* arg) {
-  std::cout << "[UCX] Connection request callback\n";
-
-  auto* self = reinterpret_cast<UcxTransport*>(arg);
-  if (!self) {
-    std::cerr << "[UCX] ERROR: Invalid self pointer\n";
-    return;
+TcpTransport::~TcpTransport() {
+  for (auto& [fd, conn] : conns_) {
+    (void)conn;
+    close(fd);
   }
+  conns_.clear();
 
-  std::lock_guard<std::mutex> lk(self->mu_);
-
-  if (!self->worker_ || !self->listener_) {
-    std::cerr << "[UCX] ERROR: worker/listener not ready, rejecting\n";
-    if (self->listener_) ucp_listener_reject(self->listener_, req);
-    return;
-  }
-
-  if (self->ep_) {
-    std::cout << "[UCX] Already have endpoint, rejecting\n";
-    ucp_listener_reject(self->listener_, req);
-    return;
-  }
-
-  ucp_ep_params_t epp;
-  std::memset(&epp, 0, sizeof(epp));
-  epp.field_mask   = UCP_EP_PARAM_FIELD_CONN_REQUEST;
-  epp.conn_request = req;
-
-  ucs_status_t st = ucp_ep_create(self->worker_, &epp, &self->ep_);
-  if (st != UCS_OK || !self->ep_) {
-    std::cerr << "[UCX] Failed to create endpoint: " << ucs_status_string(st) << "\n";
-    self->ep_ = nullptr;
-    return;
-  }
-
-  std::cout << "[UCX] Endpoint created\n";
+  if (listen_fd_ >= 0) close(listen_fd_);
+  if (peer_fd_ >= 0 && conns_.count(peer_fd_) == 0) close(peer_fd_);
+  if (ep_ >= 0) close(ep_);
 }
 
-Status UcxTransport::create_listener() {
-  std::cout << "[UCX] Creating listener on " << opt_.listen_host << ":" << opt_.listen_port << "\n";
+Status TcpTransport::make_listen_socket(const std::string& host, uint16_t port) {
+  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd_ < 0) {
+    return Status::Err(std::string("socket failed: ") + std::strerror(errno));
+  }
 
-  if (!worker_) return Status::Err("UCX worker not initialized");
+  int reuse = 1;
+  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-  sockaddr_in addr;
-  std::memset(&addr, 0, sizeof(addr));
+  sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_port   = htons(opt_.listen_port);
-
-  if (::inet_pton(AF_INET, opt_.listen_host.c_str(), &addr.sin_addr) != 1) {
-    return Status::Err("inet_pton failed for: " + opt_.listen_host);
+  addr.sin_port   = htons(port);
+  if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+    return Status::Err("inet_pton failed for: " + host);
   }
 
-  ucp_listener_params_t lp;
-  std::memset(&lp, 0, sizeof(lp));
-  lp.field_mask        = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
-                         UCP_LISTENER_PARAM_FIELD_CONN_HANDLER;
-  lp.sockaddr.addr     = (const struct sockaddr*)&addr;
-  lp.sockaddr.addrlen  = sizeof(addr);
-  lp.conn_handler.cb   = &UcxTransport::on_conn_request;
-  lp.conn_handler.arg  = this;
-
-  ucs_status_t st = ucp_listener_create(worker_, &lp, &listener_);
-  if (st != UCS_OK || !listener_) {
-    listener_ = nullptr;
-    return ucx_err("ucp_listener_create", st);
+  if (::bind(listen_fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+    return Status::Err(std::string("bind failed: ") + std::strerror(errno));
+  }
+  if (::listen(listen_fd_, kListenBacklog) < 0) {
+    return Status::Err(std::string("listen failed: ") + std::strerror(errno));
+  }
+  if (make_non_blocking(listen_fd_) < 0) {
+    return Status::Err(std::string("failed to set non-blocking: ") + std::strerror(errno));
   }
 
-  std::cout << "[UCX] Listener created\n";
+  return add_epoll_fd(ep_, listen_fd_, EPOLLIN);
+}
+
+Status TcpTransport::accept_new() {
+  while (true) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    int cfd = ::accept4(listen_fd_, (sockaddr*)&addr, &len, SOCK_NONBLOCK);
+    if (cfd < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return Status::Ok();
+      return Status::Err(std::string("accept failed: ") + std::strerror(errno));
+    }
+
+    Conn c{};
+    c.fd = cfd;
+    conns_.emplace(cfd, std::move(c));
+    if (peer_fd_ < 0) peer_fd_ = cfd;
+
+    auto st = add_epoll_fd(ep_, cfd, EPOLLIN | EPOLLRDHUP);
+    if (!st.ok) return st;
+  }
+}
+
+Status TcpTransport::queue_send(int fd, const uint8_t* bytes, size_t len) {
+  auto it = conns_.find(fd);
+  if (it == conns_.end()) return Status::Err("peer not connected");
+
+  auto& c = it->second;
+  c.tx.insert(c.tx.end(), bytes, bytes + len);
+
+  uint32_t events = EPOLLIN | EPOLLRDHUP;
+  if (!c.tx.empty()) events |= EPOLLOUT;
+  return mod_epoll_fd(ep_, fd, events);
+}
+
+Status TcpTransport::handle_write(int fd) {
+  auto it = conns_.find(fd);
+  if (it == conns_.end()) return Status::Err("peer not connected");
+  auto& c = it->second;
+
+  while (c.tx_off < c.tx.size()) {
+    ssize_t n = ::send(fd, c.tx.data() + c.tx_off, c.tx.size() - c.tx_off, 0);
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+      return Status::Err(std::string("send failed: ") + std::strerror(errno));
+    }
+    if (n == 0) break;
+    c.tx_off += (size_t)n;
+  }
+
+  if (c.tx_off >= c.tx.size()) {
+    c.tx.clear();
+    c.tx_off = 0;
+    return mod_epoll_fd(ep_, fd, EPOLLIN | EPOLLRDHUP);
+  }
+
   return Status::Ok();
 }
 
-Status UcxTransport::connect_to_server() {
-  std::cout << "[UCX] Connecting to " << opt_.server_host << ":" << opt_.server_port << "\n";
+Status TcpTransport::handle_read(int fd) {
+  auto it = conns_.find(fd);
+  if (it == conns_.end()) return Status::Err("peer not connected");
+  auto& c = it->second;
 
-  if (!worker_) return Status::Err("UCX worker not initialized");
+  uint8_t buf[kReadChunk];
+  while (true) {
+    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+      return Status::Err(std::string("recv failed: ") + std::strerror(errno));
+    }
+    if (n == 0) {
+      // peer closed
+      ::close(fd);
+      conns_.erase(it);
+      if (peer_fd_ == fd) peer_fd_ = -1;
+      return Status::Err("peer closed");
+    }
 
-  sockaddr_in addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port   = htons(opt_.server_port);
+    c.rx.insert(c.rx.end(), buf, buf + n);
 
-  if (::inet_pton(AF_INET, opt_.server_host.c_str(), &addr.sin_addr) != 1) {
-    return Status::Err("inet_pton failed for: " + opt_.server_host);
+    while (c.rx.size() >= sizeof(MsgHeader)) {
+      MsgHeader h{};
+      std::memcpy(&h, c.rx.data(), sizeof(h));
+      if (h.magic != kMagic) return Status::Err("bad magic");
+
+      size_t need = sizeof(MsgHeader) + h.length;
+      if (c.rx.size() < need) break;
+
+      IncomingMessage msg{};
+      msg.req_id = h.req_id;
+      msg.type   = h.type;
+      if (h.length) {
+        msg.payload.resize(h.length);
+        std::memcpy(msg.payload.data(), c.rx.data() + sizeof(MsgHeader), h.length);
+      }
+
+      if (on_msg_) on_msg_(msg);
+
+      c.rx.erase(c.rx.begin(), c.rx.begin() + (long)need);
+    }
   }
 
-  ucp_ep_params_t epp;
-  std::memset(&epp, 0, sizeof(epp));
-  epp.field_mask        = UCP_EP_PARAM_FIELD_FLAGS | UCP_EP_PARAM_FIELD_SOCK_ADDR;
-  epp.flags             = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
-  epp.sockaddr.addr     = (const struct sockaddr*)&addr;
-  epp.sockaddr.addrlen  = sizeof(addr);
-
-  ucs_status_t st = ucp_ep_create(worker_, &epp, &ep_);
-  if (st != UCS_OK || !ep_) {
-    ep_ = nullptr;
-    return ucx_err("ucp_ep_create(client)", st);
-  }
-
-  std::cout << "[UCX] Connected\n";
   return Status::Ok();
 }
 
-// ---------------------------- API ----------------------------
-
-Status UcxTransport::start_server(const TransportOptions& opt, MessageHandler on_msg) {
-  std::cout << "[UCX] Starting server...\n";
-
+Status TcpTransport::start_server(const TransportOptions& opt, MessageHandler on_msg) {
+  if (ep_ < 0) return Status::Err("epoll not available");
   is_server_ = true;
   opt_       = opt;
   on_msg_    = std::move(on_msg);
 
-  Status s = init_ucx_common();
-  if (!s.ok) return s;
-
-  s = create_worker_with_wakeup();
-  if (!s.ok) return s;
-
-  s = create_listener();
-  if (!s.ok) return s;
-
-  // RX buffer sized in constructor; keep as-is.
-  std::cout << "[UCX] Server started\n";
-  return Status::Ok();
+  return make_listen_socket(opt.listen_host, opt.listen_port);
 }
 
-Status UcxTransport::start_client(const TransportOptions& opt, MessageHandler on_msg) {
-  std::cout << "[UCX] Starting client...\n";
-
+Status TcpTransport::start_client(const TransportOptions& opt, MessageHandler on_msg) {
+  if (ep_ < 0) return Status::Err("epoll not available");
   is_server_ = false;
   opt_       = opt;
   on_msg_    = std::move(on_msg);
 
-  Status s = init_ucx_common();
-  if (!s.ok) return s;
+  peer_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (peer_fd_ < 0) {
+    return Status::Err(std::string("socket failed: ") + std::strerror(errno));
+  }
 
-  s = create_worker_with_wakeup();
-  if (!s.ok) return s;
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port   = htons(opt.server_port);
+  if (::inet_pton(AF_INET, opt.server_host.c_str(), &addr.sin_addr) != 1) {
+    return Status::Err("inet_pton failed for: " + opt.server_host);
+  }
 
-  s = connect_to_server();
-  if (!s.ok) return s;
+  if (::connect(peer_fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+    return Status::Err(std::string("connect failed: ") + std::strerror(errno));
+  }
+  if (make_non_blocking(peer_fd_) < 0) {
+    return Status::Err(std::string("failed to set non-blocking: ") + std::strerror(errno));
+  }
 
-  std::cout << "[UCX] Client started\n";
-  return Status::Ok();
+  Conn c{};
+  c.fd = peer_fd_;
+  conns_.emplace(peer_fd_, std::move(c));
+
+  return add_epoll_fd(ep_, peer_fd_, EPOLLIN | EPOLLRDHUP);
 }
 
-Status UcxTransport::send_bytes(const uint8_t* bytes, size_t len, uint64_t tag) {
-  std::lock_guard<std::mutex> lk(mu_);
-
-  if (!worker_) return Status::Err("UCX worker not initialized");
-  if (!ep_)     return Status::Err("UCX endpoint not connected");
-
-  ucp_request_param_t param;
-  std::memset(&param, 0, sizeof(param));
-  param.op_attr_mask = 0;
-
-  void* req = ucp_tag_send_nbx(ep_, bytes, len, tag, &param);
-  return ucx_wait(worker_, req);
-}
-
-Status UcxTransport::send(uint64_t req_id, uint16_t type, const uint8_t* data, size_t len) {
-  MsgHeader h;
-  std::memset(&h, 0, sizeof(h));
+Status TcpTransport::send(uint64_t req_id, uint16_t type, const uint8_t* data, size_t len) {
+  MsgHeader h{};
   h.magic   = kMagic;
   h.version = kProtoVer;
   h.type    = type;
@@ -427,61 +246,51 @@ Status UcxTransport::send(uint64_t req_id, uint16_t type, const uint8_t* data, s
   std::vector<uint8_t> buf;
   buf.resize(sizeof(MsgHeader) + len);
   std::memcpy(buf.data(), &h, sizeof(MsgHeader));
-  if (len) {
-    std::memcpy(buf.data() + sizeof(MsgHeader), data, len);
-  }
+  if (len) std::memcpy(buf.data() + sizeof(MsgHeader), data, len);
 
-  const uint64_t tag = (type == (uint16_t)MsgType::REQ_INFER) ? TAG_REQ : TAG_RESP;
-  return send_bytes(buf.data(), buf.size(), tag);
+  int fd = peer_fd_;
+  if (is_server_ && fd < 0 && !conns_.empty()) {
+    fd = conns_.begin()->first;
+  }
+  if (fd < 0) return Status::Err("no peer connected");
+
+  return queue_send(fd, buf.data(), buf.size());
 }
 
-void UcxTransport::pump_recv() {
-  // Public-ish wrapper: collect under lock, invoke handler outside lock.
-  std::vector<IncomingMessage> msgs;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    pump_recv_locked(this, msgs);
-  }
-  if (on_msg_) {
-    for (auto& m : msgs) on_msg_(m);
-  }
-}
+Status TcpTransport::progress(int timeout_ms) {
+  if (ep_ < 0) return Status::Err("epoll not available");
 
-Status UcxTransport::progress(int timeout_ms) {
-  if (!worker_) {
-    return Status::Err("UCX worker not initialized");
+  std::vector<epoll_event> events(opt_.epoll_max_events);
+  int n = epoll_wait(ep_, events.data(), (int)events.size(), timeout_ms);
+  if (n < 0) {
+    if (errno == EINTR) return Status::Ok();
+    return Status::Err(std::string("epoll_wait failed: ") + std::strerror(errno));
   }
 
-  std::vector<IncomingMessage> msgs;
+  for (int i = 0; i < n; i++) {
+    int fd = events[i].data.fd;
+    uint32_t ev = events[i].events;
 
-  {
-    // Serialize all UCX worker access across threads.
-    std::lock_guard<std::mutex> lk(mu_);
-
-    if (ucx_efd_ >= 0) {
-      ucs_status_t arm_st = ucp_worker_arm(worker_);
-      // BUSY means there is pending work; we will progress below.
-      if (arm_st != UCS_OK && arm_st != UCS_ERR_BUSY) {
-        return ucx_err("ucp_worker_arm", arm_st);
-      }
+    if (fd == listen_fd_) {
+      auto st = accept_new();
+      if (!st.ok) return st;
+      continue;
     }
 
-    while (ucp_worker_progress(worker_) != 0) {}
-    pump_recv_locked(this, msgs);
-  }
+    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+      ::close(fd);
+      conns_.erase(fd);
+      if (peer_fd_ == fd) peer_fd_ = -1;
+      continue;
+    }
 
-  // Call handler OUTSIDE mutex to avoid deadlocks (handler may call send()).
-  if (on_msg_) {
-    for (auto& m : msgs) on_msg_(m);
-  }
-
-  // Wait for events (optional)
-  if (timeout_ms > 0 && epoll_fd_ >= 0) {
-    epoll_event ev;
-    std::memset(&ev, 0, sizeof(ev));
-    int n = epoll_wait(epoll_fd_, &ev, 1, timeout_ms);
-    if (n < 0 && errno != EINTR) {
-      return Status::Err(std::string("epoll_wait failed: ") + std::strerror(errno));
+    if (ev & EPOLLIN) {
+      auto st = handle_read(fd);
+      if (!st.ok) return st;
+    }
+    if (ev & EPOLLOUT) {
+      auto st = handle_write(fd);
+      if (!st.ok) return st;
     }
   }
 
@@ -489,25 +298,3 @@ Status UcxTransport::progress(int timeout_ms) {
 }
 
 }  // namespace cc50
-
-#else  // CC50_ENABLE_UCX
-
-namespace cc50 {
-UcxTransport::UcxTransport() {}
-UcxTransport::~UcxTransport() {}
-Status UcxTransport::start_server(const TransportOptions&, MessageHandler) {
-  return Status::Err("UCX not enabled");
-}
-Status UcxTransport::start_client(const TransportOptions&, MessageHandler) {
-  return Status::Err("UCX not enabled");
-}
-Status UcxTransport::send(uint64_t, uint16_t, const uint8_t*, size_t) {
-  return Status::Err("UCX not enabled");
-}
-Status UcxTransport::progress(int) {
-  return Status::Err("UCX not enabled");
-}
-void UcxTransport::pump_recv() {}
-}  // namespace cc50
-
-#endif
