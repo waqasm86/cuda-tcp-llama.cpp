@@ -1,18 +1,12 @@
-# cc50-ucx-llama-server-bridge
+# cc50-tcp-llama-server-bridge
 
-A **C++/CUDA + UCX** mini inference runtime that **bridges UCX requests to an external `llama.cpp` `llama-server`** running a **GGUF** model.
-
-Why this design:
-- Your UCX/CUDA runtime stays stable and independent of libllama ABI churn.
-- You can hard-disable/avoid llama.cpp internal flash-attention issues in your build of llama.cpp.
-- This still proves you can build an LLM inference stack: transport (UCX), protocol, scheduling, streaming, and GPU work.
+A lightweight C++/CUDA mini inference runtime that bridges TCP requests to an external [`llama.cpp` `llama-server`](https://github.com/ggerganov/llama.cpp/tree/master/examples/server) instance running a GGUF model.
 
 ## What you get
 
 - `cc50_llm_server`
-  - `--transport=tcp|ucx`
   - `--backend=toy|llama_server`
-  - For `llama_server` backend, it POSTs to `http://HOST:PORT/completion` (or `/v1/completions`) and streams the result back over UCX/TCP.
+  - For the `llama_server` backend, it POSTs to `http://HOST:PORT/completion` (or `/v1/completions`) and streams the result back over a TCP socket.
 - `cc50_llm_client`
   - sends prompt + max_tokens
   - measures **mean/p50/p95/p99** latency
@@ -21,22 +15,14 @@ Why this design:
 ## Prereqs
 
 - Xubuntu 22
-- CUDA Toolkit 12.x (you already have 12.8)
-- UCX installed with `ucx.pc` visible to pkg-config (you installed UCX under `/usr/local`)
-
-If UCX was installed under `/usr/local`, export:
-
-```bash
-export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
-```
+- CUDA Toolkit 12.x (12.8 is already available in the container)
 
 ## Build
 
 ```bash
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=50 \
-  -DCC50_ENABLE_UCX=ON
+  -DCMAKE_CUDA_ARCHITECTURES=50
 
 ninja -C build
 ```
@@ -57,14 +43,13 @@ Example (adjust paths to your build + model):
   --port 8080
 ```
 
-> If your llama-server has extra flags (ctx, gpu layers, etc.) set them here.  
+> If your llama-server has extra flags (ctx, gpu layers, etc.) set them here.
 > This project does **not** try to manage model loading; llama-server owns that.
 
-### 2) Start UCX server bridge (Terminal 2)
+### 2) Start TCP server bridge (Terminal 2)
 
 ```bash
 ./build/bin/cc50_llm_server \
-  --transport=ucx \
   --backend=llama_server \
   --listen=127.0.0.1:9199 \
   --llama-url=http://127.0.0.1:8080 \
@@ -75,9 +60,8 @@ Example (adjust paths to your build + model):
 
 ```bash
 ./build/bin/cc50_llm_client \
-  --transport=ucx \
   --server=127.0.0.1:9199 \
-  --prompt "Explain UCX vs TCP in one paragraph." \
+  --prompt "Explain TCP streaming in one paragraph." \
   --max-tokens 128 \
   --iters 5 \
   --print 1
@@ -91,15 +75,8 @@ iters=5 mean_ms=... p50_ms=... p95_ms=... p99_ms=...
 
 ## Troubleshooting
 
-### UCX not found at build time
-If CMake warns that `ucx` pkg-config module isn't found:
-
-```bash
-export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
-rm -rf build
-```
-
-Then re-run CMake.
+### Transport errors
+If the client reports `peer closed` or similar, ensure both the server and client are using the same host/port and that firewalls are not blocking local connections.
 
 ### llama-server response schema differs
 This backend tries to parse common JSON keys:
@@ -108,11 +85,8 @@ This backend tries to parse common JSON keys:
 - `completion`
 - `text`
 
-If your llama-server version returns a different schema, update:
-`src/backend/llama_server_backend.cpp` (function `json_extract_string` usage).
+If your llama-server version returns a different schema, update `src/backend/llama_server_backend.cpp` (function `json_extract_string` usage).
 
 ## Why GGUF (llama.cpp) for this repo
-This repo is intentionally C++/systems-focused. GGUF + llama.cpp keeps the serving story native and lightweight, matching UCX/CUDA workflows more directly than a PyTorch/HuggingFace stack.
-# ucx-cuda
-# ucx-cuda-12
-# ucx-cuda-12
+
+This repo is intentionally C++/systems-focused. GGUF + llama.cpp keeps the serving story native and lightweight, matching CUDA workflows without pulling in a Python runtime.
