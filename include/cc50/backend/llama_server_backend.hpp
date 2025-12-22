@@ -14,7 +14,7 @@ namespace cc50 {
 //
 // We try /completion first by default and fall back to /v1/completions if needed.
 struct LlamaServerOptions {
-  std::string base_url {"http://127.0.0.1:8080"};
+  std::string base_url {"http://127.0.0.1:8090"};
   std::string endpoint {"/completion"};        // default
   int connect_timeout_ms {2000};
   int request_timeout_ms {600000};             // 10 minutes

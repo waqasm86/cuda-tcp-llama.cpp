@@ -18,5 +18,12 @@ compile_commands.json
 core
 core.*
 
-# build outputs
-build/
+# IDE settings
+.vscode/
+.idea/
+
+# Log files (your custom logs)
+cuda-tcp-llama-cpp-logs.txt
+server.log
+logs/
+

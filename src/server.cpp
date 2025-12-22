@@ -31,7 +31,7 @@ struct ServerConfig {
   uint32_t max_tokens_default{128};
 
   // llama-server HTTP options
-  std::string llama_url{"http://127.0.0.1:8080"};
+  std::string llama_url{"http://127.0.0.1:8090"};
   std::string llama_endpoint{"/completion"};
 };
 
