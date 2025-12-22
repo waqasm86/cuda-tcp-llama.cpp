@@ -1,6 +1,6 @@
-# cc50-tcp-llama-server-bridge
+# cuda-tcp-llama.cpp
 
-A lightweight C++/CUDA mini inference runtime that bridges TCP requests to an external [`llama.cpp` `llama-server`](https://github.com/ggerganov/llama.cpp/tree/master/examples/server) instance running a GGUF model.
+cuda-tcp-llama.cpp is a lightweight C++/CUDA mini inference runtime that bridges TCP requests to an external [`llama.cpp` `llama-server`](https://github.com/ggerganov/llama.cpp/tree/master/examples/server) instance running a GGUF model.
 
 ## What you get
 
